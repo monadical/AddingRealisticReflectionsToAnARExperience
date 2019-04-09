@@ -11,6 +11,17 @@ import UIKit
 
 class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
     
+    struct ManualProbe {
+        // An environment probe for shading the virtual object.
+        var objectProbeAnchor: AREnvironmentProbeAnchor?
+        // A fallback environment probe encompassing the whole scene.
+        var sceneProbeAnchor: AREnvironmentProbeAnchor?
+        // Indicates whether manually placed probes need updating.
+        var requiresRefresh: Bool = true
+        // Tracks timing of manual probe updates to prevent updating too frequently.
+        var lastUpdateTime: TimeInterval = 0
+    }
+    
     // MARK: IBOutlets
     
     @IBOutlet var sceneView: ARSCNView!
@@ -35,16 +46,21 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
     
     /// The virtual object that the user interacts with in the scene.
     var virtualObject: SCNNode?
-    /// An environment probe for shading that virtual object.
-    var environmentProbeAnchor: AREnvironmentProbeAnchor?
-    /// A fallback environment probe encompassing the whole scene.
-    var sceneEnvironmentProbeAnchor: AREnvironmentProbeAnchor?
+    /// Object to manage the manual environment probe anchor and its state
+    var manualProbe: ManualProbe?
+    
     /// Place environment probes manually or allow ARKit to place them automatically.
-    var currentTexturingMode: ARWorldTrackingConfiguration.EnvironmentTexturing = .automatic
-    /// Indicates whether manually placed probes need updating.
-    var requiresProbeRefresh = true
-    /// Tracks timing of manual probe updates to prevent updating too frequently.
-    var lastProbeAnchorUpdateTime: TimeInterval = 0
+    var environmentTexturingMode: ARWorldTrackingConfiguration.EnvironmentTexturing = .automatic {
+        didSet {
+            switch environmentTexturingMode {
+            case .manual:
+                manualProbe = ManualProbe()
+            default:
+                manualProbe = nil
+            }
+        }
+    }
+    
     /// Indicates whether ARKit has provided an environment texture.
     var isEnvironmentTextureAvailable = false
     
@@ -58,7 +74,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
         sceneView.delegate = self
         sceneView.session.delegate = self
         
-        switch currentTexturingMode {
+        switch environmentTexturingMode {
         case .manual:
             textureModeSelectionControl.selectedSegmentIndex = 1
         case .automatic:
@@ -91,16 +107,14 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
 
     // MARK: - Session management
     
-    @IBAction func changeTextureMode(_ sender: UISegmentedControl) {
+    @IBAction func changeMode(_ sender: UISegmentedControl) {
         if sender.selectedSegmentIndex == 0 {
-            currentTexturingMode = .automatic
-            environmentProbeAnchor = nil
+            environmentTexturingMode = .automatic
         } else {
-            currentTexturingMode = .manual
-            requiresProbeRefresh = true
+            environmentTexturingMode = .manual
         }
         // Remove anchors and change texturing mode
-        resetTracking(changeTextureMode: true)
+        resetTracking(changeMode: true)
     }
     
     @IBAction func restartExperience() {
@@ -111,13 +125,13 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
     }
     
     /// Runs the session with a new AR configuration to change modes or reset the experience.
-    func resetTracking(changeTextureMode: Bool = false) {
+    func resetTracking(changeMode: Bool = false) {
         let configuration = ARWorldTrackingConfiguration()
         configuration.planeDetection = .horizontal
-        configuration.environmentTexturing = currentTexturingMode
+        configuration.environmentTexturing = environmentTexturingMode
         
         let session = sceneView.session
-        if changeTextureMode {
+        if changeMode {
             // Remove existing environment probe anchors.
             session.currentFrame?.anchors
                 .filter { $0 is AREnvironmentProbeAnchor }
@@ -130,7 +144,6 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
         }
         
         isEnvironmentTextureAvailable = false
-        sceneEnvironmentProbeAnchor = nil
     }
     
     /// Updates the UI to provide feedback on the state of the AR experience.
@@ -178,15 +191,16 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
         // Update the probe only if the object has been moved or scaled,
         // only when manually placed, not too often.
         guard let object = virtualObject,
-            currentTexturingMode == .manual,
-            time - lastProbeAnchorUpdateTime >= 1.0,
-            requiresProbeRefresh
+            environmentTexturingMode == .manual,
+            var manualProbe = manualProbe,
+            time - manualProbe.lastUpdateTime >= 1.0,
+            manualProbe.requiresRefresh
             else { return }
         
         // Remove existing probe anchor, if any.
-        if let probeAnchor = self.environmentProbeAnchor {
+        if let probeAnchor = manualProbe.objectProbeAnchor {
             sceneView.session.remove(anchor: probeAnchor)
-            self.environmentProbeAnchor = nil
+            manualProbe.objectProbeAnchor = nil
         }
         
         // Make sure the probe encompasses the object and provides some surrounding area to appear in reflections.
@@ -205,20 +219,25 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
         sceneView.session.add(anchor: probeAnchor)
         
         // Remember state to prevent updating the environment probe too often.
-        environmentProbeAnchor = probeAnchor
-        lastProbeAnchorUpdateTime = CACurrentMediaTime()
-        requiresProbeRefresh = false
+        manualProbe.objectProbeAnchor = probeAnchor
+        manualProbe.lastUpdateTime = CACurrentMediaTime()
+        manualProbe.requiresRefresh = false
+        
+        self.manualProbe = manualProbe
     }
     
     /// - Tag: FallbackEnvironmentProbe
     func updateSceneEnvironmentProbe(for frame: ARFrame) {
-        if sceneEnvironmentProbeAnchor == nil && currentTexturingMode == .manual {
-            // Create an environment probe anchor with room-sized extent to act as fallback when the probe anchor of
-            // an object is removed and added during translation and scaling
-            let probeAnchor = AREnvironmentProbeAnchor(name: "sceneProbe", transform: matrix_identity_float4x4, extent: float3(5))
-            sceneView.session.add(anchor: probeAnchor)
-            sceneEnvironmentProbeAnchor = probeAnchor
-        }
+        guard environmentTexturingMode == .manual,
+            let manualProbe = manualProbe,
+            manualProbe.sceneProbeAnchor == nil
+            else { return }
+        
+        // Create an environment probe anchor with room-sized extent to act as fallback when the probe anchor of
+        // an object is removed and added during translation and scaling
+        let probeAnchor = AREnvironmentProbeAnchor(name: "sceneProbe", transform: matrix_identity_float4x4, extent: float3(5))
+        sceneView.session.add(anchor: probeAnchor)
+        self.manualProbe?.sceneProbeAnchor = probeAnchor
     }
 
     // MARK: - ARSCNViewDelegate
@@ -243,11 +262,28 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
     }
     
     func session(_ session: ARSession, didFailWithError error: Error) {
-        resetTracking()
-    }
-    
-    func sessionShouldAttemptRelocalization(_ session: ARSession) -> Bool {
-        return true
+        guard error is ARError else { return }
+        
+        let errorWithInfo = error as NSError
+        let messages = [
+            errorWithInfo.localizedDescription,
+            errorWithInfo.localizedFailureReason,
+            errorWithInfo.localizedRecoverySuggestion
+        ]
+        
+        // Remove optional error messages.
+        let errorMessage = messages.compactMap({ $0 }).joined(separator: "\n")
+        
+        DispatchQueue.main.async {
+            // Present an alert informing about the error that has occurred.
+            let alertController = UIAlertController(title: "The AR session failed.", message: errorMessage, preferredStyle: .alert)
+            let restartAction = UIAlertAction(title: "Restart Session", style: .default) { _ in
+                alertController.dismiss(animated: true, completion: nil)
+                self.resetTracking()
+            }
+            alertController.addAction(restartAction)
+            self.present(alertController, animated: true, completion: nil)
+        }
     }
     
     // MARK: ARSessionDelegate
@@ -272,7 +308,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
             if let hitTestResult = sceneView.smartHitTest(currentPosition) {
                 object.simdPosition = hitTestResult.worldTransform.translation
                 // Refresh the probe as the object keeps moving
-                requiresProbeRefresh = true
+                manualProbe?.requiresRefresh = true
             }
             lastPanTouchPosition = currentPosition
             // reset the gesture's translation
@@ -294,7 +330,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
                 // Teleport the object to wherever the user touched the screen.
                 object.simdPosition = hitTestResult.worldTransform.translation
                 // Update the environment probe anchor when object is teleported.
-                requiresProbeRefresh = true
+                manualProbe?.requiresRefresh = true
             }
         } else {
             // Add the object to the scene at the tap location.
@@ -302,7 +338,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
                 self.place(self.virtualObjectModel, basedOn: touchLocation)
                 
                 // Newly added object requires an environment probe anchor.
-                self.requiresProbeRefresh = true
+                self.manualProbe?.requiresRefresh = true
             }
         }
     }
@@ -315,7 +351,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
         gesture.scale = 1.0
         // Realistic reflections require an environment probe extent based on the size of the object,
         // so update the environment probe when the object is resized.
-        requiresProbeRefresh = true
+        manualProbe?.requiresRefresh = true
     }
     
     func place(_ object: SCNNode, basedOn location: CGPoint) {
